@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import '../models/room_model.dart';
 import '../models/player_model.dart';
 import '../models/game_state_model.dart';
-import '../theme/colors.dart';
 import '../services/socket_service.dart';
 import '../painters/gem_flight_painter.dart';
 
@@ -12,6 +11,7 @@ import '../components/common_widgets.dart';
 import '../components/players_grid.dart';
 import '../components/treasure_card.dart';
 import '../components/path_strip.dart';
+import '../components/hazard_track.dart';
 import '../components/log_list.dart';
 import '../components/ranking_list.dart';
 
@@ -175,7 +175,9 @@ class _GameBoardState extends State<GameBoard> with SingleTickerProviderStateMix
                       ),
                     ],
                   ),
-                  const SizedBox(height: 18),
+                  const SizedBox(height: 14),
+                  HazardTrack(revealedCards: game.revealedCards),
+                  const SizedBox(height: 16),
                   AnimatedSwitcher(
                     duration: const Duration(milliseconds: 520),
                     transitionBuilder: (child, animation) => RotationTransition(
@@ -194,7 +196,7 @@ class _GameBoardState extends State<GameBoard> with SingleTickerProviderStateMix
                     ),
                   ),
                   const SizedBox(height: 14),
-                  PathStrip(cards: game.revealedCards),
+                  PathStrip(cards: game.revealedCards, caveGems: game.caveGems),
                   const SizedBox(height: 16),
                   Row(
                     children: [
