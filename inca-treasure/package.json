@@ -9,7 +9,8 @@
     "build": "npm run build:client && npm run build:server",
     "build:client": "tsc -p tsconfig.client.json && node scripts/copy-client.mjs",
     "build:server": "tsc -p tsconfig.server.json",
-    "test": "npm run build && node scripts/multiplayer-smoke-test.mjs",
+    "test": "npm run test:unit && npm run build && node scripts/multiplayer-smoke-test.mjs",
+    "test:unit": "tsx --test src/server/*.test.ts",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "start": "node dist/server/index.js"
   },
