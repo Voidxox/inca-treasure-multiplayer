@@ -4,13 +4,37 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
-import { resolveSubmittedDecisions, startGame, startNextRound, submitDecision } from './game.js';
+import {
+  resolveDecisionTimeout,
+  resolveSubmittedDecisions,
+  startGame,
+  startNextRound,
+  submitDecision,
+} from './game.js';
 import type { Decision, Player, PublicRoomState, Room } from './types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDist = path.resolve(__dirname, '../client');
 const port = Number(process.env.PORT ?? 4174);
 const rooms = new Map<string, Room>();
+
+/** 断线宽限期（毫秒）：断线玩家在此期间可重连回到牌桌，超时后按撤退结算。 */
+const DISCONNECT_GRACE_MS = 25_000;
+/** 空房回收：所有玩家离线超过此时长的房间将被销毁，防止内存泄漏。 */
+const EMPTY_ROOM_TTL_MS = 60_000;
+/** 结束房回收：finished 状态房间保留一段时间供查看排名后销毁。 */
+const FINISHED_ROOM_TTL_MS = 5 * 60_000;
+/** 全局巡检间隔（毫秒）：处理决策超时、断线宽限到期、房间回收。 */
+const SWEEP_INTERVAL_MS = 5_000;
+
+/**
+ * CORS 来源白名单。生产环境通过 CORS_ORIGINS 环境变量传入逗号分隔的域名；
+ * 未配置时回退到本地开发地址，避免像原先 `*` 那样对任意站点敞开。
+ */
+const corsOrigins = (process.env.CORS_ORIGINS ?? 'http://localhost:8088,http://127.0.0.1:8088')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
 
 export function createIncaServer() {
 const server = http.createServer(async (request, response) => {
@@ -30,7 +54,8 @@ const server = http.createServer(async (request, response) => {
 });
 
 const io = new Server(server, {
-  cors: { origin: '*' },
+  // 生产环境通过 CORS_ORIGINS 锁定来源；未配置时回退为放开（仅供本地开发）。
+  cors: { origin: corsOrigins.length > 0 ? corsOrigins : '*' },
 });
 
 io.on('connection', (socket) => {
@@ -62,19 +87,40 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('joinRoom', (payload: { roomCode?: string; nickname?: string }) => {
+  socket.on('joinRoom', (payload: { roomCode?: string; nickname?: string; playerId?: string }) => {
     try {
       const code = normalizeRoomCode(payload.roomCode);
-      const nickname = normalizeNickname(payload.nickname);
       const room = getRoom(code);
+
+      // 优先按持久化的 playerId 重连：允许在游戏进行中回到原座位。
+      const rejoining = payload.playerId
+        ? room.players.find((item) => item.id === payload.playerId)
+        : undefined;
+
+      if (rejoining) {
+        rejoining.socketId = socket.id;
+        rejoining.connected = true;
+        rejoining.disconnectedAt = null;
+        playerId = rejoining.id;
+        roomCode = code;
+        touch(room);
+        socket.join(code);
+        socket.emit('roomJoined', { roomCode: code, playerId: rejoining.id });
+        pushSystemLog(room, `${rejoining.nickname} 重新连接。`);
+        broadcastRoom(room);
+        return;
+      }
+
+      // 新玩家加入：仅在等待阶段允许。
+      const nickname = normalizeNickname(payload.nickname);
       if (room.status !== 'waiting') throw new Error('房间已开始，暂不允许加入');
       if (room.players.length >= 8) throw new Error('房间已满');
+      if (room.players.some((item) => item.nickname === nickname && item.connected)) {
+        throw new Error('昵称已被占用');
+      }
 
-      const existing = room.players.find((item) => item.nickname === nickname && !item.connected);
-      const player = existing ?? createPlayer(socket.id, nickname, false);
-      player.socketId = socket.id;
-      player.connected = true;
-      if (!existing) room.players.push(player);
+      const player = createPlayer(socket.id, nickname, false);
+      room.players.push(player);
       playerId = player.id;
       roomCode = code;
       touch(room);
@@ -130,11 +176,20 @@ io.on('connection', (socket) => {
     if (!room) return;
     const player = room.players.find((item) => item.id === playerId);
     if (!player) return;
+
+    // 不立即判撤退：仅标记离线并起宽限计时，给玩家 RECONNECT_GRACE_MS 的重连窗口。
+    // 宽限期到点仍未回来，由全局 sweep 定时器兜底处理（active 玩家自动撤退、房主迁移）。
     player.connected = false;
-    if (room.status === 'playing' && player.status === 'active') {
-      player.submittedDecision = 'leave';
-      resolveSubmittedDecisions(room);
+    player.disconnectedAt = Date.now();
+
+    if (room.status === 'waiting') {
+      // 等待阶段直接移除未开始的离线玩家，避免占位。
+      room.players = room.players.filter((item) => item.id !== player.id);
+      if (room.players.length > 0 && player.isHost) {
+        promoteNewHost(room);
+      }
     }
+
     touch(room);
     broadcastRoom(room);
   });
@@ -146,7 +201,61 @@ function broadcastRoom(room: Room): void {
   });
 }
 
-return { server, io };
+// 全局巡检：决策超时结算、断线宽限到期处理、房间回收。
+const sweep = setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms) {
+    let changed = false;
+
+    // 1) 断线宽限到期：仍未回来的活跃玩家自动撤退，掉线房主迁移。
+    if (room.status === 'playing') {
+      const expired = room.players.filter(
+        (player) =>
+          !player.connected &&
+          player.disconnectedAt != null &&
+          now - player.disconnectedAt >= DISCONNECT_GRACE_MS,
+      );
+      for (const player of expired) {
+        if (player.status === 'active') {
+          player.submittedDecision = 'leave';
+          changed = true;
+        }
+        if (player.isHost) {
+          promoteNewHost(room);
+          changed = true;
+        }
+        // 标记已处理，避免重复结算。
+        player.disconnectedAt = null;
+      }
+      if (changed) {
+        resolveSubmittedDecisions(room);
+      }
+    }
+
+    // 2) 决策超时：等待过久则把未提交者默认撤退并结算。
+    if (resolveDecisionTimeout(room)) {
+      changed = true;
+    }
+
+    // 3) 房间回收：结束房超时、或全员离线超时的房间销毁，防止内存泄漏。
+    const everyoneOffline = room.players.every((player) => !player.connected);
+    const emptyExpired = everyoneOffline && now - room.updatedAt >= EMPTY_ROOM_TTL_MS;
+    const finishedExpired =
+      room.status === 'finished' && now - room.updatedAt >= FINISHED_ROOM_TTL_MS;
+    if (room.players.length === 0 || emptyExpired || finishedExpired) {
+      rooms.delete(code);
+      continue;
+    }
+
+    if (changed) {
+      touch(room);
+      broadcastRoom(room);
+    }
+  }
+}, SWEEP_INTERVAL_MS);
+sweep.unref?.();
+
+return { server, io, sweep };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -192,6 +301,7 @@ function createPlayer(socketId: string, nickname: string, isHost: boolean): Play
     temporaryGems: 0,
     status: 'waiting',
     submittedDecision: null,
+    disconnectedAt: null,
   };
 }
 
@@ -236,6 +346,29 @@ function assertHost(room: Room, id: string | null): void {
 
 function touch(room: Room): void {
   room.updatedAt = Date.now();
+}
+
+/** 把房主身份转交给第一个仍在线的玩家；无人在线则转给第一个玩家占位。 */
+function promoteNewHost(room: Room): void {
+  const current = room.players.find((item) => item.id === room.hostPlayerId);
+  if (current && current.connected) return; // 现任房主仍在线，无需迁移。
+
+  const next = room.players.find((item) => item.connected) ?? room.players[0];
+  if (!next) return;
+
+  room.players.forEach((item) => {
+    item.isHost = item.id === next.id;
+  });
+  room.hostPlayerId = next.id;
+  pushSystemLog(room, `${next.nickname} 成为新的房主。`);
+}
+
+/** 向房间的游戏日志写入一条系统消息（游戏未开始时静默跳过）。 */
+function pushSystemLog(room: Room, text: string): void {
+  const game = room.game;
+  if (!game) return;
+  game.logs.unshift({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, text });
+  game.logs = game.logs.slice(0, 8);
 }
 
 function emitError(socket: { emit: (event: string, payload: { message: string }) => void }, error: unknown): void {

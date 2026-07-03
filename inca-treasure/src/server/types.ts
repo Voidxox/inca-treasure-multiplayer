@@ -23,6 +23,8 @@ export type Player = {
   temporaryGems: number;
   status: PlayerStatus;
   submittedDecision: Decision | null;
+  /** 断线时间戳（毫秒）。null 表示在线。用于重连宽限期与房间回收判定。 */
+  disconnectedAt: number | null;
 };
 
 export type GameLog = {
@@ -40,6 +42,8 @@ export type GameState = {
   seenHazards: Partial<Record<HazardType, number>>;
   lastCard: Card | null;
   logs: GameLog[];
+  /** 决策阶段自动结算的截止时间戳（毫秒）。null 表示当前不在计时。 */
+  decisionDeadline: number | null;
 };
 
 export type Room = {

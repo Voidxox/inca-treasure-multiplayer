@@ -98,13 +98,17 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                   listenable: socketService,
                   builder: (context, _) {
                     final currentRoom = socketService.room;
-                    final connected = socketService.connected;
+                    final connState = socketService.state;
                     final message = socketService.message;
 
                     return ListView(
                       padding: const EdgeInsets.fromLTRB(16, 14, 16, 22),
                       children: [
-                        Header(room: currentRoom, connected: connected),
+                        Header(room: currentRoom, state: connState),
+                        if (connState == ConnStatus.reconnecting) ...[
+                          const SizedBox(height: 10),
+                          const ReconnectBanner(),
+                        ],
                         const SizedBox(height: 16),
                         AnimatedSwitcher(
                           duration: const Duration(milliseconds: 420),
@@ -138,7 +142,10 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
                         ),
                         if (message.isNotEmpty) ...[
                           const SizedBox(height: 12),
-                          StatusToast(message: message),
+                          StatusToast(
+                            message: message,
+                            kind: socketService.messageKind,
+                          ),
                         ],
                       ],
                     );
@@ -154,16 +161,24 @@ class _GamePageState extends State<GamePage> with SingleTickerProviderStateMixin
 }
 
 class Header extends StatelessWidget {
-  const Header({super.key, required this.room, required this.connected});
+  const Header({super.key, required this.room, required this.state});
 
   final RoomModel? room;
-  final bool connected;
+  final ConnStatus state;
 
   @override
   Widget build(BuildContext context) {
     final game = room?.game;
     final title = game == null ? '印加宝藏' : '第 ${game.round}/5 轮';
     final pill = room == null ? '入口' : room!.roomCode;
+
+    // 连接状态三态文案 + 是否点亮。
+    final (statusText, statusActive) = switch (state) {
+      ConnStatus.connected => ('在线', true),
+      ConnStatus.connecting => ('连接中', false),
+      ConnStatus.reconnecting => ('重连中', false),
+      ConnStatus.disconnected => ('离线', false),
+    };
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -201,10 +216,43 @@ class Header extends StatelessWidget {
         ),
         GlowPill(
           title: pill,
-          subtitle: connected ? '在线' : '离线',
-          active: connected,
+          subtitle: statusText,
+          active: statusActive,
         ),
       ],
     ).reveal(0);
+  }
+}
+
+/// 断线重连横幅：进行中的对局掉线时给出明确提示，而非让界面静默卡住。
+class ReconnectBanner extends StatelessWidget {
+  const ReconnectBanner({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: ember.withValues(alpha: .16),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: ember.withValues(alpha: .5)),
+      ),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2, color: ember),
+          ),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text(
+              '连接中断，正在重连…席位已为你保留。',
+              style: TextStyle(color: bone, fontSize: 13, fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
