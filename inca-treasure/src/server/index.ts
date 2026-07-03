@@ -27,6 +27,11 @@ const FINISHED_ROOM_TTL_MS = 5 * 60_000;
 /** 全局巡检间隔（毫秒）：处理决策超时、断线宽限到期、房间回收。 */
 const SWEEP_INTERVAL_MS = 5_000;
 
+/** 单 socket 事件限流：令牌桶容量（允许的突发事件数）。 */
+const RATE_BURST = 20;
+/** 单 socket 事件限流：每秒回填令牌数（稳态允许的事件速率）。 */
+const RATE_REFILL_PER_SEC = 10;
+
 /**
  * CORS 来源白名单。生产环境通过 CORS_ORIGINS 环境变量传入逗号分隔的域名；
  * 未配置时回退到本地开发地址，避免像原先 `*` 那样对任意站点敞开。
@@ -39,6 +44,14 @@ const corsOrigins = (process.env.CORS_ORIGINS ?? 'http://localhost:8088,http://1
 export function createIncaServer() {
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+
+  // 健康检查端点：供负载均衡 / 容器编排探活，返回进程存活与房间数。
+  if (url.pathname === '/health' || url.pathname === '/healthz') {
+    response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    response.end(JSON.stringify({ status: 'ok', rooms: rooms.size, uptime: process.uptime() }));
+    return;
+  }
+
   const pathname = url.pathname === '/' ? '/index.html' : url.pathname;
   const target = path.join(clientDist, pathname);
 
@@ -62,7 +75,24 @@ io.on('connection', (socket) => {
   let playerId: string | null = null;
   let roomCode: string | null = null;
 
+  // 每 socket 令牌桶限流：防止恶意客户端 emit 洪水。
+  // 容量 RATE_BURST，按 RATE_REFILL_PER_SEC 匀速回填；耗尽时丢弃事件并回错误。
+  let tokens = RATE_BURST;
+  let lastRefill = Date.now();
+  function tooFast(): boolean {
+    const now = Date.now();
+    tokens = Math.min(RATE_BURST, tokens + ((now - lastRefill) / 1000) * RATE_REFILL_PER_SEC);
+    lastRefill = now;
+    if (tokens < 1) {
+      emitError(socket, new Error('操作过于频繁，请稍候'));
+      return true;
+    }
+    tokens -= 1;
+    return false;
+  }
+
   socket.on('createRoom', (payload: { nickname?: string }) => {
+    if (tooFast()) return;
     try {
       const nickname = normalizeNickname(payload.nickname);
       const code = createRoomCode();
@@ -88,6 +118,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('joinRoom', (payload: { roomCode?: string; nickname?: string; playerId?: string }) => {
+    if (tooFast()) return;
     try {
       const code = normalizeRoomCode(payload.roomCode);
       const room = getRoom(code);
@@ -133,6 +164,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('startGame', () => {
+    if (tooFast()) return;
     try {
       const room = getCurrentRoom(roomCode);
       assertHost(room, playerId);
@@ -146,6 +178,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('submitDecision', (payload: { decision?: Decision }) => {
+    if (tooFast()) return;
     try {
       const room = getCurrentRoom(roomCode);
       if (payload.decision !== 'continue' && payload.decision !== 'leave') throw new Error('选择无效');
@@ -159,6 +192,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('nextRound', () => {
+    if (tooFast()) return;
     try {
       const room = getCurrentRoom(roomCode);
       assertHost(room, playerId);
@@ -259,10 +293,26 @@ return { server, io, sweep };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { server } = createIncaServer();
+  const { server, io, sweep } = createIncaServer();
   server.listen(port, () => {
     console.log(`Inca Treasure server listening on http://127.0.0.1:${port}`);
   });
+
+  // 优雅关闭：容器 / 编排器发来 SIGTERM/SIGINT 时，停掉巡检定时器、
+  // 关闭 socket 连接与 HTTP server，给正在进行的请求留出收尾时间。
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}, shutting down gracefully...`);
+    clearInterval(sweep);
+    io.close();
+    server.close(() => process.exit(0));
+    // 兜底：10s 内未能正常关闭则强制退出，避免进程挂死。
+    setTimeout(() => process.exit(1), 10_000).unref?.();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 function publicRoom(room: Room, me: string): PublicRoomState {
