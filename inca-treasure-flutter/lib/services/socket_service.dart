@@ -13,9 +13,10 @@ class SocketService extends ChangeNotifier {
   ConnStatus _state = ConnStatus.disconnected;
   String? _joinedRoomCode;
 
-  // 重连所需的持久身份：记住自己的 playerId 与所在房间/昵称，
-  // 断线重连后自动用 playerId 回到原座位（服务端支持进行中重连）。
+  // 重连所需的持久身份：记住自己的 playerId / secret 与所在房间/昵称，
+  // 断线重连后自动用 playerId + secret 回到原座位（服务端校验 secret 防座位劫持）。
   String? _playerId;
+  String? _secret;
   String? _nickname;
 
   RoomModel? get room => _room;
@@ -49,7 +50,7 @@ class SocketService extends ChangeNotifier {
     _socket!
       ..onConnect((_) {
         _state = ConnStatus.connected;
-        // 若此前已在某房间，重连后自动回房（携带 playerId 回到原座位）。
+        // 若此前已在某房间，重连后自动回房（携带 playerId + secret 回到原座位）。
         _autoRejoin();
         notifyListeners();
       })
@@ -68,9 +69,12 @@ class SocketService extends ChangeNotifier {
         final map = payload as Map;
         final code = map['roomCode'] as String;
         _joinedRoomCode = code;
-        // 记住服务端分配的 playerId，供后续重连回房使用。
+        // 记住服务端分配的 playerId 与 secret，供后续重连回房与身份校验使用。
         if (map['playerId'] != null) {
           _playerId = map['playerId'].toString();
+        }
+        if (map['secret'] != null) {
+          _secret = map['secret'].toString();
         }
         _message = '已加入房间 $code';
         _messageKind = MessageKind.success;
@@ -90,7 +94,7 @@ class SocketService extends ChangeNotifier {
     _socket!.connect();
   }
 
-  /// 重连成功后，如果之前已加入房间，用持久化的 playerId 自动回到原座位。
+  /// 重连成功后，如果之前已加入房间，用持久化的 playerId + secret 自动回到原座位。
   void _autoRejoin() {
     final code = _joinedRoomCode;
     if (code == null || _playerId == null) return;
@@ -98,6 +102,7 @@ class SocketService extends ChangeNotifier {
       'roomCode': code,
       'nickname': _nickname ?? '',
       'playerId': _playerId,
+      if (_secret != null) 'secret': _secret,
     });
   }
 
@@ -114,6 +119,7 @@ class SocketService extends ChangeNotifier {
       'roomCode': roomCode,
       'nickname': nickname,
       if (_playerId != null) 'playerId': _playerId,
+      if (_secret != null) 'secret': _secret,
     });
   }
 
@@ -136,6 +142,7 @@ class SocketService extends ChangeNotifier {
     _room = null;
     _joinedRoomCode = null;
     _playerId = null;
+    _secret = null;
     _message = '';
     notifyListeners();
   }

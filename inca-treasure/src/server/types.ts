@@ -25,6 +25,8 @@ export type Player = {
   submittedDecision: Decision | null;
   /** 断线时间戳（毫秒）。null 表示在线。用于重连宽限期与房间回收判定。 */
   disconnectedAt: number | null;
+  /** 服务端签发的身份凭证：仅回给本人，重连与敏感操作需匹配，防止冒充他人 playerId。 */
+  secret: string;
 };
 
 export type GameLog = {
@@ -56,7 +58,7 @@ export type Room = {
   updatedAt: number;
 };
 
-export type PublicPlayer = Omit<Player, 'socketId'> & {
+export type PublicPlayer = Omit<Player, 'socketId' | 'secret'> & {
   hasSubmitted: boolean;
   submittedDecision: null;
 };

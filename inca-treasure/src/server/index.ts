@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { Server } from 'socket.io';
 import {
   resolveDecisionTimeout,
@@ -110,14 +111,15 @@ io.on('connection', (socket) => {
       playerId = player.id;
       roomCode = code;
       socket.join(code);
-      socket.emit('roomJoined', { roomCode: code, playerId: player.id });
+      // secret 仅回给本人，作为后续重连的身份凭证。
+      socket.emit('roomJoined', { roomCode: code, playerId: player.id, secret: player.secret });
       broadcastRoom(room);
     } catch (error) {
       emitError(socket, error);
     }
   });
 
-  socket.on('joinRoom', (payload: { roomCode?: string; nickname?: string; playerId?: string }) => {
+  socket.on('joinRoom', (payload: { roomCode?: string; nickname?: string; playerId?: string; secret?: string }) => {
     if (tooFast()) return;
     try {
       const code = normalizeRoomCode(payload.roomCode);
@@ -129,6 +131,10 @@ io.on('connection', (socket) => {
         : undefined;
 
       if (rejoining) {
+        // 校验身份凭证：secret 只有本人持有，防止用猜到的 playerId 劫持他人座位。
+        if (!payload.secret || payload.secret !== rejoining.secret) {
+          throw new Error('身份校验失败，无法重连');
+        }
         rejoining.socketId = socket.id;
         rejoining.connected = true;
         rejoining.disconnectedAt = null;
@@ -136,7 +142,7 @@ io.on('connection', (socket) => {
         roomCode = code;
         touch(room);
         socket.join(code);
-        socket.emit('roomJoined', { roomCode: code, playerId: rejoining.id });
+        socket.emit('roomJoined', { roomCode: code, playerId: rejoining.id, secret: rejoining.secret });
         pushSystemLog(room, `${rejoining.nickname} 重新连接。`);
         broadcastRoom(room);
         return;
@@ -156,7 +162,8 @@ io.on('connection', (socket) => {
       roomCode = code;
       touch(room);
       socket.join(code);
-      socket.emit('roomJoined', { roomCode: code, playerId: player.id });
+      // secret 仅回给本人，作为后续重连的身份凭证。
+      socket.emit('roomJoined', { roomCode: code, playerId: player.id, secret: player.secret });
       broadcastRoom(room);
     } catch (error) {
       emitError(socket, error);
@@ -211,7 +218,7 @@ io.on('connection', (socket) => {
     const player = room.players.find((item) => item.id === playerId);
     if (!player) return;
 
-    // 不立即判撤退：仅标记离线并起宽限计时，给玩家 RECONNECT_GRACE_MS 的重连窗口。
+    // 不立即判撤退：仅标记离线并起宽限计时，给玩家 DISCONNECT_GRACE_MS 的重连窗口。
     // 宽限期到点仍未回来，由全局 sweep 定时器兜底处理（active 玩家自动撤退、房主迁移）。
     player.connected = false;
     player.disconnectedAt = Date.now();
@@ -323,7 +330,8 @@ function publicRoom(room: Room, me: string): PublicRoomState {
     createdAt: room.createdAt,
     updatedAt: room.updatedAt,
     me,
-    players: room.players.map(({ socketId, submittedDecision, ...player }) => ({
+    // 剔除 socketId 与 secret：这两者绝不外泄给其他客户端。
+    players: room.players.map(({ socketId, secret, submittedDecision, ...player }) => ({
       ...player,
       hasSubmitted: Boolean(submittedDecision),
       submittedDecision: null,
@@ -352,6 +360,7 @@ function createPlayer(socketId: string, nickname: string, isHost: boolean): Play
     status: 'waiting',
     submittedDecision: null,
     disconnectedAt: null,
+    secret: randomUUID(),
   };
 }
 
