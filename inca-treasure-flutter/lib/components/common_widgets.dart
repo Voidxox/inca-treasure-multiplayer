@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../theme/colors.dart';
+import '../services/socket_service.dart' show MessageKind;
 
 extension Reveal on Widget {
   Widget reveal(int index) => TweenAnimationBuilder<double>(
@@ -222,13 +223,30 @@ class GlowPill extends StatelessWidget {
 }
 
 class StatusToast extends StatelessWidget {
-  const StatusToast({super.key, required this.message});
+  const StatusToast({super.key, required this.message, this.kind = MessageKind.info});
 
   final String message;
+  final MessageKind kind;
 
   @override
-  Widget build(BuildContext context) => GlassPanel(
-        padding: const EdgeInsets.all(12),
-        child: Text(message, style: const TextStyle(color: Color(0xffffb09f))),
-      ).reveal(0);
+  Widget build(BuildContext context) {
+    // 按语义配色：错误偏红、成功偏 jade、信息偏 bone，不再让成功提示显示为错误红。
+    final (color, icon) = switch (kind) {
+      MessageKind.error => (const Color(0xffffb09f), Icons.error_outline_rounded),
+      MessageKind.success => (jade, Icons.check_circle_outline_rounded),
+      MessageKind.info => (bone, Icons.info_outline_rounded),
+    };
+    return GlassPanel(
+      padding: const EdgeInsets.all(12),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(message, style: TextStyle(color: color)),
+          ),
+        ],
+      ),
+    ).reveal(0);
+  }
 }

@@ -11,6 +11,13 @@ export const hazardNames: Record<HazardType, string> = {
   curse: '古墓诅咒',
 };
 
+/**
+ * 决策阶段允许玩家思考的时长（毫秒）。
+ * 超时后仍未提交的活跃玩家按“撤退”默认结算：既保住其本轮已得宝石，
+ * 又能把挂机者移出本轮，避免游戏无限期卡在同一人身上。
+ */
+export const DECISION_TIMEOUT_MS = 45_000;
+
 export function createGame(): GameState {
   return {
     round: 1,
@@ -22,6 +29,7 @@ export function createGame(): GameState {
     seenHazards: {},
     lastCard: null,
     logs: [],
+    decisionDeadline: null,
   };
 }
 
@@ -63,6 +71,7 @@ export function startNextRound(room: Room): void {
     seenHazards: {},
     lastCard: null,
     logs: [...game.logs],
+    decisionDeadline: null,
   };
   pushLog(room.game, `第 ${nextRound} 轮开始。`);
   revealNextCard(room);
@@ -94,6 +103,28 @@ export function resolveSubmittedDecisions(room: Room): void {
   }
 }
 
+/**
+ * 决策超时结算：若房间正处于决策阶段且已过截止时间，
+ * 把所有尚未提交的活跃玩家默认判为“撤退”，然后正常结算。
+ * 返回是否发生了结算（供上层决定是否需要广播）。
+ */
+export function resolveDecisionTimeout(room: Room): boolean {
+  if (!room.game) return false;
+  const game = room.game;
+  if (room.status !== 'playing' || game.phase !== 'waitingDecision') return false;
+  if (game.decisionDeadline == null || Date.now() < game.decisionDeadline) return false;
+
+  const pending = activePlayers(room).filter((player) => !player.submittedDecision);
+  if (pending.length > 0) {
+    pending.forEach((player) => {
+      player.submittedDecision = 'leave';
+    });
+    pushLog(game, `${names(pending)} 决策超时，自动撤退保住已得宝石。`);
+  }
+  resolveDecisions(room);
+  return true;
+}
+
 export function revealNextCard(room: Room): void {
   const game = requireGame(room);
   if (activePlayers(room).length === 0 || game.deck.length === 0) {
@@ -115,13 +146,13 @@ export function revealNextCard(room: Room): void {
 
   if (card.type === 'treasure') {
     resolveTreasure(room, card.value);
-    game.phase = 'waitingDecision';
+    beginDecisionPhase(game);
     return;
   }
 
   if (card.type === 'relic') {
     game.relics.push(card.value);
-    game.phase = 'waitingDecision';
+    beginDecisionPhase(game);
     pushLog(game, `发现价值 ${card.value} 的遗物，单独撤退者可以带走它。`);
     return;
   }
@@ -139,8 +170,14 @@ export function revealNextCard(room: Room): void {
     return;
   }
 
-  game.phase = 'waitingDecision';
+  beginDecisionPhase(game);
   pushLog(game, `${hazardNames[card.hazardType]}出现一次，继续深入会更危险。`);
+}
+
+/** 进入决策阶段并开始计时。所有转入 waitingDecision 的路径都应经由此函数。 */
+function beginDecisionPhase(game: GameState): void {
+  game.phase = 'waitingDecision';
+  game.decisionDeadline = Date.now() + DECISION_TIMEOUT_MS;
 }
 
 function resolveTreasure(room: Room, value: number): void {
@@ -157,6 +194,7 @@ function resolveTreasure(room: Room, value: number): void {
 
 function resolveDecisions(room: Room): void {
   const game = requireGame(room);
+  game.decisionDeadline = null;
   const leavers = activePlayers(room).filter((player) => player.submittedDecision === 'leave');
 
   if (leavers.length > 0) {
@@ -195,6 +233,7 @@ function resolveDecisions(room: Room): void {
 function finishRound(room: Room, reason: string): void {
   const game = requireGame(room);
   game.phase = game.round >= 5 ? 'gameEnd' : 'roundEnd';
+  game.decisionDeadline = null;
   if (game.round >= 5) room.status = 'finished';
   room.players.forEach((player) => {
     if (player.status === 'active') player.status = 'left';
