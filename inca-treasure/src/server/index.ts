@@ -12,6 +12,7 @@ import {
   startNextRound,
   submitDecision,
 } from './game.js';
+import { logger } from './logger.js';
 import type { Decision, Player, PublicRoomState, Room } from './types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,6 +77,8 @@ io.on('connection', (socket) => {
   let playerId: string | null = null;
   let roomCode: string | null = null;
 
+  logger.debug('socket.connected', { socketId: socket.id });
+
   // 每 socket 令牌桶限流：防止恶意客户端 emit 洪水。
   // 容量 RATE_BURST，按 RATE_REFILL_PER_SEC 匀速回填；耗尽时丢弃事件并回错误。
   let tokens = RATE_BURST;
@@ -85,6 +88,7 @@ io.on('connection', (socket) => {
     tokens = Math.min(RATE_BURST, tokens + ((now - lastRefill) / 1000) * RATE_REFILL_PER_SEC);
     lastRefill = now;
     if (tokens < 1) {
+      logger.warn('rate.limited', { socketId: socket.id, roomCode });
       emitError(socket, new Error('操作过于频繁，请稍候'));
       return true;
     }
@@ -114,6 +118,7 @@ io.on('connection', (socket) => {
       // secret 仅回给本人，作为后续重连的身份凭证。
       socket.emit('roomJoined', { roomCode: code, playerId: player.id, secret: player.secret });
       broadcastRoom(room);
+      logger.info('room.created', { roomCode: code, playerId: player.id, totalRooms: rooms.size });
     } catch (error) {
       emitError(socket, error);
     }
@@ -133,6 +138,7 @@ io.on('connection', (socket) => {
       if (rejoining) {
         // 校验身份凭证：secret 只有本人持有，防止用猜到的 playerId 劫持他人座位。
         if (!payload.secret || payload.secret !== rejoining.secret) {
+          logger.warn('reconnect.rejected', { roomCode: code, playerId: rejoining.id });
           throw new Error('身份校验失败，无法重连');
         }
         rejoining.socketId = socket.id;
@@ -145,6 +151,7 @@ io.on('connection', (socket) => {
         socket.emit('roomJoined', { roomCode: code, playerId: rejoining.id, secret: rejoining.secret });
         pushSystemLog(room, `${rejoining.nickname} 重新连接。`);
         broadcastRoom(room);
+        logger.info('player.reconnected', { roomCode: code, playerId: rejoining.id });
         return;
       }
 
@@ -165,6 +172,7 @@ io.on('connection', (socket) => {
       // secret 仅回给本人，作为后续重连的身份凭证。
       socket.emit('roomJoined', { roomCode: code, playerId: player.id, secret: player.secret });
       broadcastRoom(room);
+      logger.info('player.joined', { roomCode: code, playerId: player.id, players: room.players.length });
     } catch (error) {
       emitError(socket, error);
     }
@@ -179,6 +187,7 @@ io.on('connection', (socket) => {
       startGame(room);
       touch(room);
       broadcastRoom(room);
+      logger.info('game.started', { roomCode: room.roomCode, players: room.players.length });
     } catch (error) {
       emitError(socket, error);
     }
@@ -233,6 +242,7 @@ io.on('connection', (socket) => {
 
     touch(room);
     broadcastRoom(room);
+    logger.info('player.disconnected', { roomCode: room.roomCode, playerId: player.id, status: room.status });
   });
 });
 
@@ -285,6 +295,7 @@ const sweep = setInterval(() => {
       room.status === 'finished' && now - room.updatedAt >= FINISHED_ROOM_TTL_MS;
     if (room.players.length === 0 || emptyExpired || finishedExpired) {
       rooms.delete(code);
+      logger.info('room.recycled', { roomCode: code, reason: room.players.length === 0 ? 'empty' : finishedExpired ? 'finished' : 'idle', totalRooms: rooms.size });
       continue;
     }
 
@@ -302,7 +313,7 @@ return { server, io, sweep };
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const { server, io, sweep } = createIncaServer();
   server.listen(port, () => {
-    console.log(`Inca Treasure server listening on http://127.0.0.1:${port}`);
+    logger.info('server.listening', { port });
   });
 
   // 优雅关闭：容器 / 编排器发来 SIGTERM/SIGINT 时，停掉巡检定时器、
@@ -311,7 +322,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`Received ${signal}, shutting down gracefully...`);
+    logger.info('server.shutdown', { signal });
     clearInterval(sweep);
     io.close();
     server.close(() => process.exit(0));
@@ -420,6 +431,7 @@ function promoteNewHost(room: Room): void {
   });
   room.hostPlayerId = next.id;
   pushSystemLog(room, `${next.nickname} 成为新的房主。`);
+  logger.info('host.migrated', { roomCode: room.roomCode, newHost: next.id });
 }
 
 /** 向房间的游戏日志写入一条系统消息（游戏未开始时静默跳过）。 */
